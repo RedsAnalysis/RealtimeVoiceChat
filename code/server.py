@@ -27,25 +27,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import HTMLResponse, Response, FileResponse
 
+# --- START: MONKEY-PATCH FOR SPACY/KOKORO BUG ---
+# This block provides a reproducible fix for the broken spaCy download check in kokoro-tts.
+# It replaces the problematic function with a dummy one that does nothing.
+# This MUST be placed before the other application imports that might trigger it.
+try:
+    import spacy.cli
+    def dummy_download(*args, **kwargs):
+        logger.info("Monkey-patch: Skipped spacy.cli.download call.")
+        return  # Do nothing
+    spacy.cli.download = dummy_download
+    logger.info("✅ Monkey-patch for spacy.cli.download applied successfully.")
+except ImportError:
+    logger.warning("⚠️ SpaCy not found, skipping monkey-patch. This may cause issues if using Kokoro TTS.")
+# --- END: MONKEY-PATCH ---
+
 USE_SSL = False
-TTS_START_ENGINE = "orpheus"
-TTS_START_ENGINE = "kokoro"
-TTS_START_ENGINE = "coqui"
-TTS_ORPHEUS_MODEL = "Orpheus_3B-1BaseGGUF/mOrpheus_3B-1Base_Q4_K_M.gguf"
-TTS_ORPHEUS_MODEL = "orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf"
-
-LLM_START_PROVIDER = "ollama"
-#LLM_START_MODEL = "qwen3:30b-a3b"
-LLM_START_MODEL = "hf.co/bartowski/huihui-ai_Mistral-Small-24B-Instruct-2501-abliterated-GGUF:Q4_K_M"
-# LLM_START_PROVIDER = "lmstudio"
-# LLM_START_MODEL = "Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q3_K_L.gguf"
-NO_THINK = False
-DIRECT_STREAM = TTS_START_ENGINE=="orpheus"
-
-if __name__ == "__main__":
-    logger.info(f"🖥️⚙️ {Colors.apply('[PARAM]').blue} Starting engine: {Colors.apply(TTS_START_ENGINE).blue}")
-    logger.info(f"🖥️⚙️ {Colors.apply('[PARAM]').blue} Direct streaming: {Colors.apply('ON' if DIRECT_STREAM else 'OFF').blue}")
-
 # Define the maximum allowed size for the incoming audio queue
 try:
     MAX_AUDIO_QUEUE_SIZE = int(os.getenv("MAX_AUDIO_QUEUE_SIZE", 50))
@@ -108,47 +105,54 @@ class NoCacheStaticFiles(StaticFiles):
 async def lifespan(app: FastAPI):
     """
     Manages the application's lifespan, initializing and shutting down resources.
-
-    Initializes global components like SpeechPipelineManager, Upsampler, and
-    AudioInputProcessor and stores them in `app.state`. Handles cleanup on shutdown.
-
-    Args:
-        app: The FastAPI application instance.
     """
     logger.info("🖥️▶️ Server starting up")
 
-    # --- Load Configuration from Environment Variables ---
-    # This makes the server respect your .env file
-    llm_backend = os.getenv("LLM_BACKEND", "ollama") # Default to ollama if not set
+    # --- Load All Configuration Dynamically from Environment Variables ---
     
-    # Select the correct model variable based on the backend
+    # Load LLM Config
+    llm_backend = os.getenv("LLM_BACKEND", "ollama")
     if llm_backend == "vllm":
         llm_model = os.getenv("VLLM_MODEL")
-    elif llm_backend == "lmstudio":
-        llm_model = os.getenv("LMSTUDIO_MODEL") # Assuming you might add this
-    else: # Default to ollama
+    else: # Add other backends here if needed
         llm_model = os.getenv("OLLAMA_MODEL", "llama3:instruct")
     
     if not llm_model:
-        raise ValueError(f"LLM model not configured for backend '{llm_backend}'. Please set the appropriate environment variable (e.g., VLLM_MODEL).")
+        raise ValueError(f"LLM model not configured for backend '{llm_backend}'.")
+
+    # Load TTS and STT Config
+    tts_engine = os.getenv("TTS_ENGINE", "coqui")
+    
+    # Load engine-specific settings ONLY if needed
+    orpheus_model_path = None
+    if tts_engine == "orpheus":
+        orpheus_model_path = os.getenv("ORPHEUS_MODEL")
+        if not orpheus_model_path:
+            logger.warning("TTS_ENGINE is 'orpheus' but ORPHEUS_MODEL is not set in .env!")
+    
+    # Load other settings
+    no_think_str = os.getenv("NO_THINK", "False").lower()
+    no_think = no_think_str in ('true', '1', 't')
 
     logger.info(f"🖥️⚙️ Initializing LLM with backend: {Colors.apply(llm_backend).blue}, Model: {Colors.apply(llm_model).blue}")
-    # ---------------------------------------------------
+    logger.info(f"🖥️⚙️ Initializing TTS with engine: {Colors.apply(tts_engine).blue}")
+    if orpheus_model_path:
+        logger.info(f"🖥️⚙️ Orpheus Model Path: {Colors.apply(orpheus_model_path).blue}")
 
-    # Initialize global components, using the loaded configuration
+    # --- Initialize global components with the loaded configuration ---
     app.state.SpeechPipelineManager = SpeechPipelineManager(
-        tts_engine=TTS_START_ENGINE,
-        llm_provider=llm_backend,     # Use the variable from .env
-        llm_model=llm_model,          # Use the variable from .env
-        no_think=NO_THINK,
-        orpheus_model=TTS_ORPHEUS_MODEL,
+        tts_engine=tts_engine,
+        llm_provider=llm_backend,
+        llm_model=llm_model,
+        no_think=no_think,
+        orpheus_model=orpheus_model_path # Pass the path, which will be None if not using Orpheus
     )
 
     app.state.Upsampler = UpsampleOverlap()
     app.state.AudioInputProcessor = AudioInputProcessor(
         LANGUAGE,
-        is_orpheus=TTS_START_ENGINE=="orpheus",
-        pipeline_latency=app.state.SpeechPipelineManager.full_output_pipeline_latency / 1000, # seconds
+        is_orpheus=(tts_engine == "orpheus"),
+        pipeline_latency=app.state.SpeechPipelineManager.full_output_pipeline_latency / 1000,
     )
     app.state.Aborting = False
 

@@ -5,6 +5,7 @@ import logging
 import time
 from queue import Queue, Empty
 import sys
+import os
 
 # (Make sure real/mock imports are correct)
 from audio_module import AudioProcessor
@@ -121,63 +122,48 @@ class SpeechPipelineManager:
     """
     def __init__(
             self,
-            tts_engine: str = "kokoro",
-            llm_provider: str = "ollama", # This value will come from server.py
-            llm_model: str = "...",      # This value will come from server.py
-            no_think: bool = False,
-            orpheus_model: str = "orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf",
+            tts_engine: str,
+            llm_provider: str,
+            llm_model: str,
+            no_think: bool,
+            orpheus_model: Optional[str] = None # Now accepts an optional model path
         ):
         """
         Initializes the SpeechPipelineManager.
-
-        Sets up configuration, instantiates dependencies (AudioProcessor, LLM, etc.),
-        defines system prompts, initializes state variables (queues, events, flags),
-        measures initial inference latencies, and starts the background worker threads.
-
-        Args:
-            tts_engine: The TTS engine to use (e.g., "kokoro", "orpheus").
-            llm_provider: The LLM backend provider (e.g., "ollama", "vllm").
-            llm_model: The specific LLM model identifier.
-            no_think: If True, removes specific thinking tags from LLM output.
-            orpheus_model: Path or identifier for the Orpheus TTS model, if used.
         """
         self.tts_engine = tts_engine
         self.llm_provider = llm_provider
         self.llm_model = llm_model
         self.no_think = no_think
-        self.orpheus_model = orpheus_model
+        self.orpheus_model = orpheus_model # Store the path (or None)
 
-        # --- START: Updated Dynamic Prompt Loading Logic ---
-        # Read the filenames from the environment variables.
-        # It's flexible, checking for both old and new variable names.
+        # --- Dynamic Prompt Loading ---
         persona_filename = os.getenv("PERSONA_FILE") or os.getenv("SYSTEM_PROMPT_FILE")
         context_filename = os.getenv("CONTEXT_FILE")
 
-        # Load Persona/Role Prompt from the 'prompts/persona/' directory
+        # Load Persona
         persona_prompt = ""
         if persona_filename:
-            # Construct the new, nested path
             prompt_path = os.path.join("prompts", "persona", persona_filename)
             try:
                 with open(prompt_path, "r", encoding="utf-8") as f:
                     persona_prompt = f.read().strip()
                 logger.info(f"🗣️📄 Persona prompt loaded from: {prompt_path}")
             except FileNotFoundError:
-                logger.error(f"🗣️💥 ERROR: Persona file not found at '{prompt_path}'. Check your .env file.")
+                logger.error(f"🗣️💥 ERROR: Persona file not found: '{prompt_path}'")
         
-        # Load Static Context from the 'prompts/context/' directory
+        # Load Context
         static_context = ""
         if context_filename:
-            # Construct the new, nested path
             context_path = os.path.join("prompts", "context", context_filename)
             try:
                 with open(context_path, "r", encoding="utf-8") as f:
                     static_context = f.read().strip()
                 logger.info(f"🗣️📄 Static context loaded from: {context_path}")
             except FileNotFoundError:
-                logger.warning(f"🗣️⚠️ Context file not found: '{context_path}'. Continuing without it.")
+                logger.warning(f"🗣️⚠️ Context file not found: '{context_path}'.")
 
-        # Assemble the final System Prompt from the loaded parts
+        # Assemble the final System Prompt
         final_prompt_parts = []
         if persona_prompt:
             final_prompt_parts.append(f"### YOUR PERSONA AND RULES ###\n{persona_prompt}")
@@ -185,21 +171,21 @@ class SpeechPipelineManager:
             final_prompt_parts.append(f"### BACKGROUND CONTEXT ###\n{static_context}")
 
         if not final_prompt_parts:
-            logger.error("🗣️💥 No prompt or context loaded. Using a basic default.")
             self.system_prompt = "You are a helpful assistant."
         else:
             self.system_prompt = "\n\n".join(final_prompt_parts)
         
+        # --- Conditionally add Orpheus-specific instructions ---
+        if self.tts_engine == "orpheus":
+            self.system_prompt += f"\n\n{orpheus_prompt_addon}"
+            logger.info("🗣️📄 Appended Orpheus-specific instructions to system prompt.")
+        
         logger.debug(f"Final System Prompt:\n{self.system_prompt}")
-        # --- END: Updated Dynamic Prompt Loading Logic ---
 
-        if tts_engine == "orpheus":
-            self.system_prompt += f"\n{orpheus_prompt_addon}"
-
-        # --- Instance Dependencies ---
+       # --- Instance Dependencies ---
         self.audio = AudioProcessor(
             engine=self.tts_engine,
-            orpheus_model=self.orpheus_model
+            orpheus_model=self.orpheus_model # Pass path (or None) to the audio processor
         )
         self.audio.on_first_audio_chunk_synthesize = self.on_first_audio_chunk_synthesize
         self.text_similarity = TextSimilarity(focus='end', n_words=5)
@@ -218,7 +204,16 @@ class SpeechPipelineManager:
 
         self.llm.prewarm()
         self.llm_inference_time = self.llm.measure_inference_time()
-        logger.debug(f"🗣️🧠🕒 LLM inference time: {self.llm_inference_time:.2f}ms")
+
+        # --- Add a check to handle connection failures gracefully ---
+        if self.llm_inference_time is not None:
+            logger.debug(f"🗣️🧠🕒 LLM inference time: {self.llm_inference_time:.2f}ms")
+            self.full_output_pipeline_latency = self.llm_inference_time + self.audio.tts_inference_time
+        else:
+            logger.error("🗣️🧠🕒 LLM inference time could not be measured (likely connection issue). Setting to default 0.")
+            self.llm_inference_time = 0.0 # Set a default value to prevent crashes
+            self.full_output_pipeline_latency = self.audio.tts_inference_time
+        # -----------------------------------------------------------
 
         # --- State ---
         self.history = []
@@ -260,7 +255,7 @@ class SpeechPipelineManager:
 
         self.on_partial_assistant_text: Optional[Callable[[str], None]] = None
 
-        self.full_output_pipeline_latency = self.llm_inference_time + self.audio.tts_inference_time
+        
         logger.info(f"🗣️⏱️ Full output pipeline latency: {self.full_output_pipeline_latency:.2f}ms (LLM: {self.llm_inference_time:.2f}ms, TTS: {self.audio.tts_inference_time:.2f}ms)")
 
         logger.info("🗣️🚀 SpeechPipelineManager initialized and workers started.")
