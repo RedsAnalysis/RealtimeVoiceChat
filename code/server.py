@@ -103,6 +103,7 @@ class NoCacheStaticFiles(StaticFiles):
 # --------------------------------------------------------------------
 # Lifespan management
 # --------------------------------------------------------------------
+# AFTER
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -115,11 +116,30 @@ async def lifespan(app: FastAPI):
         app: The FastAPI application instance.
     """
     logger.info("🖥️▶️ Server starting up")
-    # Initialize global components, not connection-specific state
+
+    # --- Load Configuration from Environment Variables ---
+    # This makes the server respect your .env file
+    llm_backend = os.getenv("LLM_BACKEND", "ollama") # Default to ollama if not set
+    
+    # Select the correct model variable based on the backend
+    if llm_backend == "vllm":
+        llm_model = os.getenv("VLLM_MODEL")
+    elif llm_backend == "lmstudio":
+        llm_model = os.getenv("LMSTUDIO_MODEL") # Assuming you might add this
+    else: # Default to ollama
+        llm_model = os.getenv("OLLAMA_MODEL", "llama3:instruct")
+    
+    if not llm_model:
+        raise ValueError(f"LLM model not configured for backend '{llm_backend}'. Please set the appropriate environment variable (e.g., VLLM_MODEL).")
+
+    logger.info(f"🖥️⚙️ Initializing LLM with backend: {Colors.apply(llm_backend).blue}, Model: {Colors.apply(llm_model).blue}")
+    # ---------------------------------------------------
+
+    # Initialize global components, using the loaded configuration
     app.state.SpeechPipelineManager = SpeechPipelineManager(
         tts_engine=TTS_START_ENGINE,
-        llm_provider=LLM_START_PROVIDER,
-        llm_model=LLM_START_MODEL,
+        llm_provider=llm_backend,     # Use the variable from .env
+        llm_model=llm_model,          # Use the variable from .env
         no_think=NO_THINK,
         orpheus_model=TTS_ORPHEUS_MODEL,
     )
@@ -130,7 +150,7 @@ async def lifespan(app: FastAPI):
         is_orpheus=TTS_START_ENGINE=="orpheus",
         pipeline_latency=app.state.SpeechPipelineManager.full_output_pipeline_latency / 1000, # seconds
     )
-    app.state.Aborting = False # Keep this? Its usage isn't clear in the provided snippet. Minimizing changes.
+    app.state.Aborting = False
 
     yield
 
@@ -944,7 +964,7 @@ if __name__ == "__main__":
     # Run the server without SSL
     if not USE_SSL:
         logger.info("🖥️▶️ Starting server without SSL.")
-        uvicorn.run("server:app", host="0.0.0.0", port=8000, log_config=None)
+        uvicorn.run("server:app", host="0.0.0.0", port=8001, log_config=None)
 
     else:
         logger.info("🖥️🔒 Attempting to start server with SSL.")
@@ -965,7 +985,7 @@ if __name__ == "__main__":
         uvicorn.run(
             "server:app",
             host="0.0.0.0",
-            port=8000,
+            port=8001,
             log_config=None,
             ssl_certfile=cert_file,
             ssl_keyfile=key_file,
