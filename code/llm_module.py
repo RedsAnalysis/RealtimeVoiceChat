@@ -31,7 +31,7 @@ except ImportError:
     class APITimeoutError(APIError): pass
     class RateLimitError(APIError): pass
     class APIConnectionError(APIError): pass
-    logging.warning("🤖⚠️ openai library not installed. OpenAI/LMStudio backends will not function.")
+    logging.warning("🤖⚠️ openai library not installed. OpenAI/LMStudio/vLLM backends will not function.")
 
 # Configure logging
 # Use the root logger configured by the main application if available, else basic config
@@ -61,6 +61,9 @@ except ImportError:
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 LMSTUDIO_BASE_URL = os.getenv("LMSTUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
+# --- Start: vLLM Addition ---
+VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000")
+# --- End: vLLM Addition ---
 
 # --- Backend Client Creation/Check Functions ---
 def _create_openai_client(api_key: Optional[str], base_url: Optional[str] = None) -> OpenAI:
@@ -91,10 +94,18 @@ def _create_openai_client(api_key: Optional[str], base_url: Optional[str] = None
             "max_retries": 2
         }
         if base_url:
-            client_args["base_url"] = base_url
+            # --- Start: vLLM Addition (URL Normalization) ---
+            # Ensure the base URL for OpenAI-compatible servers ends with /v1
+            if not base_url.endswith('/v1'):
+                normalized_url = base_url.rstrip('/') + "/v1"
+                logger.debug(f"🤖⚙️ Normalizing OpenAI-compatible base URL from '{base_url}' to '{normalized_url}'")
+                client_args["base_url"] = normalized_url
+            else:
+                client_args["base_url"] = base_url
+            # --- End: vLLM Addition ---
 
         client = OpenAI(**client_args)
-        logger.info(f"🤖🔌 Prepared OpenAI-compatible client (Base URL: {base_url or 'Default'}).")
+        logger.info(f"🤖🔌 Prepared OpenAI-compatible client (Base URL: {client_args.get('base_url') or 'Default'}).")
         return client
     except Exception as e:
         logger.error(f"🤖💥 Failed to initialize OpenAI client: {e}")
@@ -186,11 +197,12 @@ class LLM:
     """
     Provides a unified interface for interacting with various LLM backends.
 
-    Supports Ollama (via direct HTTP), OpenAI API, and LMStudio (via OpenAI-compatible API).
+    Supports Ollama (via direct HTTP), OpenAI API, LMStudio and vLLM (via OpenAI-compatible API).
     Handles client initialization, streaming generation, request cancellation,
     system prompts, and basic connection management including an optional `ollama ps` check.
     """
-    SUPPORTED_BACKENDS = ["ollama", "openai", "lmstudio"]
+    # --- vLLM Addition ---
+    SUPPORTED_BACKENDS = ["ollama", "openai", "lmstudio", "vllm"]
 
     def __init__(
         self,
@@ -205,7 +217,7 @@ class LLM:
         Initializes the LLM interface for a specific backend and model.
 
         Args:
-            backend: The name of the LLM backend to use (e.g., "ollama", "openai", "lmstudio").
+            backend: The name of the LLM backend to use (e.g., "ollama", "openai", "lmstudio", "vllm").
             model: The identifier for the specific model to use within the backend.
             system_prompt: An optional system prompt to prepend to conversations.
             api_key: API key, primarily for OpenAI backend (can be omitted for others if not needed).
@@ -223,8 +235,9 @@ class LLM:
 
         if self.backend == "ollama" and not REQUESTS_AVAILABLE:
              raise ImportError("requests library is required for the 'ollama' backend but not installed.")
-        if self.backend in ["openai", "lmstudio"] and not OPENAI_AVAILABLE:
-             raise ImportError("openai library is required for the 'openai'/'lmstudio' backends but not installed.")
+
+        if self.backend in ["openai", "lmstudio", "vllm"] and not OPENAI_AVAILABLE:
+             raise ImportError(f"openai library is required for the '{self.backend}' backend but not installed.")
 
         self.model = model
         self.system_prompt = system_prompt
@@ -245,7 +258,9 @@ class LLM:
         self.effective_openai_key = self._api_key or OPENAI_API_KEY
         self.effective_ollama_url = self._base_url or OLLAMA_BASE_URL if self.backend == "ollama" else None
         self.effective_lmstudio_url = self._base_url or LMSTUDIO_BASE_URL if self.backend == "lmstudio" else None
+        self.effective_vllm_url = self._base_url or VLLM_BASE_URL if self.backend == "vllm" else None
         self.effective_openai_base_url = self._base_url if self.backend == "openai" and self._base_url else None
+
 
         if self.backend == "ollama" and self.effective_ollama_url:
              url = self.effective_ollama_url
@@ -277,13 +292,13 @@ class LLM:
             False otherwise.
         """
         if self._client_initialized:
-            if self.backend in ["openai", "lmstudio"]: return self.client is not None
+            if self.backend in ["openai", "lmstudio", "vllm"]: return self.client is not None # Modified for vLLM
             if self.backend == "ollama": return self.ollama_session is not None and self._ollama_connection_ok # Check flag
             return False
 
         with self._client_init_lock:
             if self._client_initialized: # Double check
-                if self.backend in ["openai", "lmstudio"]: return self.client is not None
+                if self.backend in ["openai", "lmstudio", "vllm"]: return self.client is not None # Modified for vLLM
                 if self.backend == "ollama": return self.ollama_session is not None and self._ollama_connection_ok
                 return False
 
@@ -298,6 +313,29 @@ class LLM:
                 elif self.backend == "lmstudio":
                     self.client = _create_openai_client(api_key="lmstudio-key", base_url=self.effective_lmstudio_url)
                     init_ok = self.client is not None
+                # --- Start: vLLM Addition ---
+                elif self.backend == "vllm":
+                    self.client = _create_openai_client(api_key="no-key-needed", base_url=self.effective_vllm_url)
+                    init_ok = self.client is not None
+                    # Test connection with a simple models list call
+                    if init_ok:
+                        try:
+                            logger.info(f"🤖🔌 Attempting to connect to vLLM server at {self.effective_vllm_url}...")
+                            models = self.client.models.list()
+                            # The model name in vLLM is often the path you loaded it with, which is what you pass in the API call.
+                            # So, we check if the requested model is in the list of what the server *thinks* it's serving.
+                            available_models = [m.id for m in models.data]
+                            logger.info(f"🤖🔌 Successfully connected to vLLM server. Available models: {available_models}")
+                            if self.model not in available_models:
+                                logger.warning(f"🤖⚠️ vLLM server is connected, but the requested model '{self.model}' is not in the available list: {available_models}. The API call may fail.")
+                        except APIConnectionError as e:
+                            logger.error(f"🤖🔌❌ vLLM connection test failed: Could not connect to the server. {e}")
+                            init_ok = False
+                        except Exception as e:
+                            logger.warning(f"🤖🔌❌ vLLM connection test raised an exception: {e}. This might happen if the server is not fully OpenAI-compatible.")
+                            # We might proceed with init_ok = True if the client was created, but log a strong warning.
+                            init_ok = False # For safety, let's consider it a failure.
+                # --- End: vLLM Addition ---
                 elif self.backend == "ollama":
                     if self.ollama_session and self.effective_ollama_url:
                         # Initial direct check
@@ -681,6 +719,23 @@ class LLM:
                 stream_object_to_register = stream_iterator # The Stream object itself
                 self._register_request(req_id, "lmstudio", stream_object_to_register)
                 yield from self._yield_openai_chunks(stream_iterator, req_id)
+            
+            # --- Start: vLLM Addition ---
+            elif self.backend == "vllm":
+                if self.client is None:
+                    raise RuntimeError("vLLM client not initialized (should have been caught by lazy_init).")
+                if 'temperature' not in kwargs:
+                    kwargs['temperature'] = 0.7
+                payload = { "model": self.model, "messages": messages, "stream": True, **kwargs }
+                logger.info(f"🤖💬 [{req_id}] Sending vLLM request with payload:")
+                logger.info(f"{json.dumps(payload, indent=2)}")
+                stream_iterator = self.client.chat.completions.create(
+                    model=self.model, messages=messages, stream=True, **kwargs
+                )
+                stream_object_to_register = stream_iterator # The Stream object itself
+                self._register_request(req_id, "vllm", stream_object_to_register)
+                yield from self._yield_openai_chunks(stream_iterator, req_id)
+            # --- End: vLLM Addition ---
 
             elif self.backend == "ollama":
                 if self.ollama_session is None:
@@ -748,7 +803,7 @@ class LLM:
     # --- Backend-Specific Chunk Yielding Helpers ---
     def _yield_openai_chunks(self, stream, request_id: str) -> Generator[str, None, None]:
         """
-        Iterates over an OpenAI/LMStudio stream, yielding content chunks.
+        Iterates over an OpenAI/LMStudio/vLLM stream, yielding content chunks.
 
         Handles extracting content from stream chunks and checks for cancellation
         before processing each chunk. Ensures the stream is closed upon completion,
@@ -772,7 +827,7 @@ class LLM:
                 # Check for cancellation *before* processing chunk
                 with self._requests_lock:
                     if request_id not in self._active_requests:
-                        logger.info(f"🤖🗑️ OpenAI/LMStudio stream {request_id} cancelled or finished externally during iteration.")
+                        logger.info(f"🤖🗑️ OpenAI-compatible stream {request_id} cancelled or finished externally during iteration.")
                         # No need to manually close stream here; cancellation logic or finally block handles it.
                         break # Exit the loop cleanly
                 if chunk.choices:
@@ -781,14 +836,14 @@ class LLM:
                     if content:
                         token_count += 1
                         yield content
-            logger.debug(f"🤖✅ [{request_id}] Finished yielding {token_count} OpenAI/LMStudio tokens.")
+            logger.debug(f"🤖✅ [{request_id}] Finished yielding {token_count} OpenAI-compatible tokens.")
         except APIConnectionError as e:
              # Often happens if the stream is closed prematurely by cancellation
              is_cancelled = False
              with self._requests_lock:
                  is_cancelled = request_id not in self._active_requests
              if is_cancelled:
-                  logger.warning(f"🤖⚠️ OpenAI/LMStudio stream connection error likely due to cancellation for {request_id}: {e}")
+                  logger.warning(f"🤖⚠️ OpenAI-compatible stream connection error likely due to cancellation for {request_id}: {e}")
              else:
                   logger.error(f"🤖💥 OpenAI API connection error during streaming ({request_id}): {e}")
                   raise ConnectionError(f"OpenAI communication error during streaming: {e}") from e
@@ -801,19 +856,19 @@ class LLM:
             with self._requests_lock:
                 is_cancelled = request_id not in self._active_requests
             if is_cancelled:
-                logger.warning(f"🤖⚠️ OpenAI/LMStudio stream error likely due to cancellation for {request_id}: {e}")
+                logger.warning(f"🤖⚠️ OpenAI-compatible stream error likely due to cancellation for {request_id}: {e}")
             else:
-                logger.error(f"🤖💥 Unexpected error during OpenAI streaming ({request_id}): {e}", exc_info=True)
+                logger.error(f"🤖💥 Unexpected error during OpenAI-compatible streaming ({request_id}): {e}", exc_info=True)
                 raise # Reraise for generate() to handle
         finally:
             # Ensure the stream is closed if iteration finishes or breaks
             # The cancellation logic also tries to close, but this catches normal completion
             if stream and hasattr(stream, 'close') and callable(stream.close):
                  try:
-                     logger.debug(f"🤖🗑️ [{request_id}] Closing OpenAI stream in _yield_openai_chunks finally.")
+                     logger.debug(f"🤖🗑️ [{request_id}] Closing OpenAI-compatible stream in _yield_openai_chunks finally.")
                      stream.close()
                  except Exception as close_err:
-                     logger.warning(f"🤖⚠️ [{request_id}] Error closing OpenAI stream in finally: {close_err}", exc_info=False)
+                     logger.warning(f"🤖⚠️ [{request_id}] Error closing OpenAI-compatible stream in finally: {close_err}", exc_info=False)
 
     def _yield_ollama_chunks(self, response: requests.Response, request_id: str) -> Generator[str, None, None]:
         """
@@ -1198,7 +1253,7 @@ if __name__ == "__main__":
                         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
                         stream=sys.stdout)
     main_logger = logging.getLogger(__name__) # Logger for this __main__ block
-    main_logger.info("🤖🚀 --- Running LLM Module Example (With Ollama PS Check Restored) ---") # Modified title
+    main_logger.info("🤖🚀 --- Running LLM Module Example ---")
 
     # --- Ollama Example ---
     ollama_llm = None
@@ -1271,8 +1326,56 @@ if __name__ == "__main__":
     else:
         main_logger.warning("🤖⚠️ Skipping Ollama tests: 'requests' library not installed.")
 
-    # --- Add LMStudio/OpenAI examples if needed ---
-    # ... (similar structure, ensure OPENAI_AVAILABLE check)
+    # --- Start: vLLM Addition ---
+    # --- vLLM Example ---
+    vllm_llm = None
+    if OPENAI_AVAILABLE:
+        try:
+            vllm_model_env = os.getenv("VLLM_MODEL")
+            if not vllm_model_env:
+                main_logger.warning("🤖⚠️ VLLM_MODEL environment variable not set. Using default 'meta-llama/Llama-2-7b-chat-hf'. You must load the server with this model.")
+                vllm_model_env = "meta-llama/Llama-2-7b-chat-hf"
+
+            main_logger.info(f"\n🤖⚙️ --- Initializing vLLM ({vllm_model_env}) ---")
+            vllm_llm = LLM(
+                backend="vllm",
+                model=vllm_model_env,
+                system_prompt="You are a helpful AI assistant built by vLLM."
+            )
+
+            main_logger.info("🤖🔥 --- Running vLLM Prewarm ---")
+            prewarm_success = vllm_llm.prewarm(max_retries=0)
+
+            if prewarm_success:
+                main_logger.info("🤖✅ vLLM Prewarm/Initialization OK.")
+
+                main_logger.info("🤖⏱️ --- Running vLLM Inference Time Measurement ---")
+                inf_time = vllm_llm.measure_inference_time(num_tokens=10, temperature=0.1)
+                if inf_time is not None:
+                    main_logger.info(f"🤖⏱️ --- Measured vLLM Inference Time: {inf_time:.2f} ms ---")
+                else:
+                    main_logger.warning("🤖⏱️⚠️ --- vLLM Inference Time Measurement Failed ---")
+
+                main_logger.info("🤖▶️ --- Running vLLM Generation via Context ---")
+                try:
+                    with LLMGenerationContext(vllm_llm, "Explain the concept of neural networks in three sentences.") as generator:
+                        print("\nvLLM Response: ", end="", flush=True)
+                        for token in generator:
+                            print(token, end="", flush=True)
+                        print("\n")
+                    main_logger.info("🤖✅ vLLM generation complete.")
+                except (ConnectionError, RuntimeError, APIError, Exception) as e:
+                    main_logger.error(f"🤖💥 vLLM Generation Error: {e}")
+                    main_logger.error("   🤖🔌 Please ensure the vLLM OpenAI-compatible server is running and accessible at the configured URL.")
+            else:
+                main_logger.error("🤖❌ vLLM Prewarm/Initialization Failed. Check the server URL, model name, and logs.")
+
+        except (ImportError, ValueError, Exception) as e:
+            main_logger.error(f"🤖💥 Failed to initialize or run vLLM: {e}", exc_info=True)
+    else:
+        main_logger.warning("🤖⚠️ Skipping vLLM tests: 'openai' library not installed.")
+    # --- End: vLLM Addition ---
+
 
     main_logger.info("\n" + "="*40)
     main_logger.info("🤖🏁 --- LLM Module Example Script Finished ---")
