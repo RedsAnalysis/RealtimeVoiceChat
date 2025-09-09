@@ -122,8 +122,8 @@ class SpeechPipelineManager:
     def __init__(
             self,
             tts_engine: str = "kokoro",
-            llm_provider: str = "ollama",
-            llm_model: str = "hf.co/bartowski/huihui-ai_Mistral-Small-24B-Instruct-2501-abliterated-GGUF:Q4_K_M",
+            llm_provider: str = "ollama", # This value will come from server.py
+            llm_model: str = "...",      # This value will come from server.py
             no_think: bool = False,
             orpheus_model: str = "orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf",
         ):
@@ -131,12 +131,12 @@ class SpeechPipelineManager:
         Initializes the SpeechPipelineManager.
 
         Sets up configuration, instantiates dependencies (AudioProcessor, LLM, etc.),
-        loads system prompts, initializes state variables (queues, events, flags),
+        defines system prompts, initializes state variables (queues, events, flags),
         measures initial inference latencies, and starts the background worker threads.
 
         Args:
             tts_engine: The TTS engine to use (e.g., "kokoro", "orpheus").
-            llm_provider: The LLM backend provider (e.g., "ollama").
+            llm_provider: The LLM backend provider (e.g., "ollama", "vllm").
             llm_model: The specific LLM model identifier.
             no_think: If True, removes specific thinking tags from LLM output.
             orpheus_model: Path or identifier for the Orpheus TTS model, if used.
@@ -147,7 +147,52 @@ class SpeechPipelineManager:
         self.no_think = no_think
         self.orpheus_model = orpheus_model
 
-        self.system_prompt = system_prompt
+        # --- START: Updated Dynamic Prompt Loading Logic ---
+        # Read the filenames from the environment variables.
+        # It's flexible, checking for both old and new variable names.
+        persona_filename = os.getenv("PERSONA_FILE") or os.getenv("SYSTEM_PROMPT_FILE")
+        context_filename = os.getenv("CONTEXT_FILE")
+
+        # Load Persona/Role Prompt from the 'prompts/persona/' directory
+        persona_prompt = ""
+        if persona_filename:
+            # Construct the new, nested path
+            prompt_path = os.path.join("prompts", "persona", persona_filename)
+            try:
+                with open(prompt_path, "r", encoding="utf-8") as f:
+                    persona_prompt = f.read().strip()
+                logger.info(f"🗣️📄 Persona prompt loaded from: {prompt_path}")
+            except FileNotFoundError:
+                logger.error(f"🗣️💥 ERROR: Persona file not found at '{prompt_path}'. Check your .env file.")
+        
+        # Load Static Context from the 'prompts/context/' directory
+        static_context = ""
+        if context_filename:
+            # Construct the new, nested path
+            context_path = os.path.join("prompts", "context", context_filename)
+            try:
+                with open(context_path, "r", encoding="utf-8") as f:
+                    static_context = f.read().strip()
+                logger.info(f"🗣️📄 Static context loaded from: {context_path}")
+            except FileNotFoundError:
+                logger.warning(f"🗣️⚠️ Context file not found: '{context_path}'. Continuing without it.")
+
+        # Assemble the final System Prompt from the loaded parts
+        final_prompt_parts = []
+        if persona_prompt:
+            final_prompt_parts.append(f"### YOUR PERSONA AND RULES ###\n{persona_prompt}")
+        if static_context:
+            final_prompt_parts.append(f"### BACKGROUND CONTEXT ###\n{static_context}")
+
+        if not final_prompt_parts:
+            logger.error("🗣️💥 No prompt or context loaded. Using a basic default.")
+            self.system_prompt = "You are a helpful assistant."
+        else:
+            self.system_prompt = "\n\n".join(final_prompt_parts)
+        
+        logger.debug(f"Final System Prompt:\n{self.system_prompt}")
+        # --- END: Updated Dynamic Prompt Loading Logic ---
+
         if tts_engine == "orpheus":
             self.system_prompt += f"\n{orpheus_prompt_addon}"
 
@@ -161,12 +206,16 @@ class SpeechPipelineManager:
         self.text_context = TextContext()
         self.generation_counter: int = 0
         self.abort_lock = threading.Lock()
+        
+        # --- LLM Initialization now correctly uses the passed-in parameters ---
         self.llm = LLM(
-            backend=self.llm_provider, # Or your backend
-            model=self.llm_model,
+            backend=self.llm_provider, # Uses the provider from .env (via server.py)
+            model=self.llm_model,      # Uses the model from .env (via server.py)
             system_prompt=self.system_prompt,
             no_think=no_think,
         )
+        # --- End of LLM Initialization ---
+
         self.llm.prewarm()
         self.llm_inference_time = self.llm.measure_inference_time()
         logger.debug(f"🗣️🧠🕒 LLM inference time: {self.llm_inference_time:.2f}ms")
